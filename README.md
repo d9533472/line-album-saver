@@ -4,7 +4,7 @@
 
 全部在自己電腦上執行（用 Windows 內建 OCR 辨識文字），不連網、不上傳任何照片。
 
-> 非 LINE 官方工具，與 LINE Corporation 無關。
+> 非 LINE 官方工具，與 LINE Corporation 無關。使用前請先閱讀下方〈免責聲明〉。
 
 ## 下載
 
@@ -61,3 +61,11 @@ powershell -ExecutionPolicy Bypass -File build.ps1
 
 - 視窗類型用 UI Automation 類別判斷：`GroupHomeWindow`＝相簿總覽、`AlbumDetailWindow`＝單本相簿、`LcContextMenu`＝⋮ 選單、`ChatWindow`＝對話視窗。
 - 總覽捲軸用 RangeValue 直接設定，並用捲軸值換算每本相簿的絕對位置，避免重複或漏掉。
+
+## 免責聲明
+
+本工具為個人製作、免費分享，僅供個人使用，並非 LINE 官方工具，與 LINE Corporation 無關。
+
+- 作者不保證本工具能正常運作或完全正確，也不提供任何保固或技術支援。
+- 使用本工具所造成的任何資料遺失、相簿誤刪或其他損害，作者概不負責。
+- 使用前請自行評估風險，並務必先備份重要照片。下載或使用本工具，即表示您已了解並同意以上內容。
