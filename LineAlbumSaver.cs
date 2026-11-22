@@ -8,6 +8,7 @@ using System.Drawing;
 using System.Drawing.Imaging;
 using System.IO;
 using System.Linq;
+using System.Net;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -784,12 +785,14 @@ namespace LineAlbumSaver {
     sealed class MainForm : Form {
         static readonly string Settings = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "LineAlbumSaver.txt");
         public static bool PreviewMode;
+        // 意見回饋轉寄服務（feedback/ 資料夾的 Apps Script 網頁應用程式）
+        const string FeedbackUrl = "https://script.google.com/macros/s/AKfycbziNboMwm5_kDyZ8lhlmOEdUVje-Fyv_Bqf5bfG0Pj9risq-nNAjfX2qO4KCUJ-Vnx6hA/exec";
 
         readonly float S;
         readonly Bitmap nmdcLogo, lineLogo;
         readonly ComboBox windows = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Dock = DockStyle.Fill, FlatStyle = FlatStyle.Flat, DrawMode = DrawMode.OwnerDrawFixed };
         readonly TextBox dest = new TextBox { Dock = DockStyle.Fill, ReadOnly = true, BorderStyle = BorderStyle.None, TabStop = false };
-        readonly Btn refresh, browse, scan, download, stop, recheck, openDir, selAll, selNone, del;
+        readonly Btn refresh, browse, scan, download, stop, recheck, openDir, selAll, selNone, del, feedback;
         readonly NumericUpDown timeout = new NumericUpDown { Minimum = 60, Maximum = 7200, Value = 600, Increment = 60, TextAlign = HorizontalAlignment.Center, BorderStyle = BorderStyle.None };
         readonly Label hint = new Label { AutoSize = true };
         readonly Label chipAll, chipOk, chipSkip, chipBad;
@@ -820,6 +823,7 @@ namespace LineAlbumSaver {
             download = MakeButton("②  下載勾選的相簿"); download.Primary = true; download.Font = scan.Font; download.Padding = scan.Padding;
             stop = MakeButton("■  停止  F8"); stop.Danger = true; stop.Enabled = false;
             recheck = MakeButton("✓  重新核對"); openDir = MakeButton("開啟資料夾"); selAll = MakeButton("全選"); selNone = MakeButton("全不選"); del = MakeButton("🗑  刪除勾選的相簿"); del.Danger = true;
+            feedback = MakeButton("✉  意見回饋"); tips.SetToolTip(feedback, "回報問題或給作者建議");
             chipAll = Chip(Theme.Text, Color.FromArgb(22, 42, 58)); chipOk = Chip(Theme.GreenHi, Theme.OkBg); chipSkip = Chip(Theme.Muted, Theme.SkipBg); chipBad = Chip(Theme.Red, Theme.BadBg);
 
             var root = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 4, Margin = new Padding(0), BackColor = Theme.Page };
@@ -829,7 +833,8 @@ namespace LineAlbumSaver {
             root.RowStyles.Add(new RowStyle(SizeType.Absolute, P(96)));
             Controls.Add(root);
 
-            header.Paint += PaintHeader; header.Resize += (s, e) => header.Invalidate();
+            header.Paint += PaintHeader; header.Resize += (s, e) => { header.Invalidate(); PlaceFeedback(); };
+            header.BackColor = Color.FromArgb(0, 36, 64); header.Controls.Add(feedback);
             typeof(Panel).GetProperty("DoubleBuffered", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic).SetValue(header, true, null);
             root.Controls.Add(header, 0, 0);
 
@@ -900,6 +905,7 @@ namespace LineAlbumSaver {
             del.Click += (s, e) => DeletePicked();
             stop.Click += (s, e) => { if (cts != null) { cts.Cancel(); Log("收到停止指令，處理完目前動作後停止。"); } };
             recheck.Click += (s, e) => Recheck();
+            feedback.Click += (s, e) => ShowFeedback();
             try { if (File.Exists(Settings)) SetDest(File.ReadAllText(Settings, Encoding.UTF8).Trim()); } catch { }
             Shown += (s, e) => { FitHint(); if (PreviewMode) return; N.RegisterHotKey(Handle, 1, 0, (uint)Keys.F8); RefreshWindows(); };
             FormClosed += (s, e) => N.UnregisterHotKey(Handle, 1);
@@ -949,6 +955,13 @@ namespace LineAlbumSaver {
                 using (var b = new SolidBrush(Color.FromArgb(70, sc))) g.FillEllipse(b, px + P(6), cy - P(5), P(10), P(10));
                 using (var b = new SolidBrush(sc)) { g.FillEllipse(b, px + P(8.5f), cy - P(2.5f), P(5), P(5)); g.DrawString(st, f, b, px + P(18), cy - sz.Height / 2); }
             }
+        }
+
+        // 意見回饋按鈕放在標題列右側、狀態燈左邊（用 RUNNING 的寬度算，切換狀態時不會跳動）。
+        void PlaceFeedback() {
+            int pill;
+            using (var f = new Font("Consolas", 7f, FontStyle.Bold)) using (var g = header.CreateGraphics()) pill = (int)g.MeasureString("RUNNING", f).Width + P(24);
+            feedback.Location = new Point(header.Width - P(14) - pill - P(10) - feedback.Width, (header.Height - P(2) - feedback.Height) / 2);
         }
 
         Btn MakeButton(string text) {
@@ -1198,6 +1211,70 @@ namespace LineAlbumSaver {
                 f.Shown += (s, e) => input.Focus();
                 return f.ShowDialog(this) == DialogResult.OK && input.Text.Trim() == "刪除";
             }
+        }
+
+        // 意見回饋：填寫後送到 Apps Script，由它寄信給作者。
+        void ShowFeedback() {
+            using (var f = new Form { Text = "意見回饋", FormBorderStyle = FormBorderStyle.FixedDialog, MaximizeBox = false, MinimizeBox = false, StartPosition = FormStartPosition.CenterParent, BackColor = Theme.Card, ForeColor = Theme.Text, Font = Font, ClientSize = new Size(P(460), P(420)) }) {
+                var t = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, Padding = new Padding(P(12), P(10), P(12), P(10)) };
+                t.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize)); t.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+                var intro = new Label { AutoSize = true, ForeColor = Theme.Muted, Margin = new Padding(0, 0, 0, P(8)), MaximumSize = new Size(P(430), 0),
+                    Text = "遇到問題或有任何建議，都歡迎告訴作者。送出後會寄信給作者；想收到回覆的話，請留下 Email。" };
+                var kind = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, FlatStyle = FlatStyle.Flat, BackColor = Theme.Field, ForeColor = Theme.Text, Width = P(140), Margin = new Padding(0, P(2), 0, P(6)) };
+                kind.Items.AddRange(new object[] { "問題回報", "功能建議", "其他" }); kind.SelectedIndex = 0;
+                var message = new TextBox { Multiline = true, ScrollBars = ScrollBars.Vertical, AcceptsReturn = true, Dock = DockStyle.Fill, BackColor = Theme.Field, ForeColor = Theme.Text, BorderStyle = BorderStyle.FixedSingle, MaxLength = 5000, Margin = new Padding(0, P(2), 0, P(6)) };
+                var contact = new TextBox { Dock = DockStyle.Fill, BackColor = Theme.Field, ForeColor = Theme.Text, BorderStyle = BorderStyle.FixedSingle, MaxLength = 200, Margin = new Padding(0, P(2), 0, P(6)) };
+                var withLog = new CheckBox { Text = "附上執行紀錄（內含相簿名稱與資料夾路徑，方便作者查問題）", AutoSize = true, ForeColor = Theme.Muted, Margin = new Padding(0, 0, 0, P(6)), Enabled = logBox.TextLength > 0 };
+                var status = new Label { AutoSize = true, Anchor = AnchorStyles.Left, ForeColor = Theme.Muted, MaximumSize = new Size(P(250), 0) };
+                var send = new Btn { Text = "送出", Primary = true, AutoSize = true, Padding = new Padding(P(14), P(2), P(14), P(2)), Enabled = false, ForeColor = Theme.Text, Margin = new Padding(P(8), 0, 0, 0) };
+                var cancel = new Btn { Text = "取消", AutoSize = true, Padding = new Padding(P(14), P(2), P(14), P(2)), DialogResult = DialogResult.Cancel, ForeColor = Theme.Text, Margin = new Padding(P(8), 0, 0, 0) };
+                var buttons = new FlowLayoutPanel { AutoSize = true, Anchor = AnchorStyles.Right, WrapContents = false, Margin = new Padding(0) };
+                buttons.Controls.Add(send); buttons.Controls.Add(cancel);
+                var bottom = new TableLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, ColumnCount = 2, Margin = new Padding(0, P(4), 0, 0) };
+                bottom.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100)); bottom.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+                bottom.Controls.Add(status, 0, 0); bottom.Controls.Add(buttons, 1, 0);
+
+                Func<string, Label> label = s => new Label { Text = s, AutoSize = true, ForeColor = Theme.Muted, Margin = new Padding(0, P(5), P(10), 0) };
+                t.Controls.Add(intro, 0, 0); t.SetColumnSpan(intro, 2);
+                t.Controls.Add(label("類型"), 0, 1); t.Controls.Add(kind, 1, 1);
+                t.Controls.Add(label("內容"), 0, 2); t.Controls.Add(message, 1, 2);
+                t.Controls.Add(label("Email（選填）"), 0, 3); t.Controls.Add(contact, 1, 3);
+                t.Controls.Add(withLog, 1, 4);
+                t.Controls.Add(bottom, 0, 5); t.SetColumnSpan(bottom, 2);
+                for (int i = 0; i < 6; i++) t.RowStyles.Add(i == 2 ? new RowStyle(SizeType.Percent, 100) : new RowStyle(SizeType.AutoSize));
+                f.Controls.Add(t);
+                f.CancelButton = cancel;
+
+                message.TextChanged += (s, e) => send.Enabled = message.Text.Trim().Length > 0;
+                send.Click += async (s, e) => {
+                    send.Enabled = cancel.Enabled = false; status.ForeColor = Theme.Muted; status.Text = "送出中…";
+                    var data = new System.Collections.Specialized.NameValueCollection {
+                        { "kind", kind.Text }, { "message", message.Text.Trim() }, { "contact", contact.Text.Trim() },
+                        { "version", AppVersion() }, { "os", OsName() }, { "log", withLog.Checked ? Tail(logBox.Text, 20000) : "" } };
+                    string error = null;
+                    try {
+                        ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls12;
+                        string resp;
+                        using (var wc = new WebClient()) resp = Encoding.UTF8.GetString(await wc.UploadValuesTaskAsync(new Uri(FeedbackUrl), "POST", data));
+                        if (!Regex.IsMatch(resp, @"""ok""\s*:\s*true")) { var m = Regex.Match(resp, @"""error""\s*:\s*""([^""]*)"""); error = m.Success ? m.Groups[1].Value : "伺服器回應異常"; }
+                    } catch (Exception ex) { error = ex.Message; }
+                    if (f.IsDisposed) return;
+                    if (error == null) { MessageBox.Show(f, "已送出，謝謝你的回饋！", "意見回饋"); f.DialogResult = DialogResult.OK; return; }
+                    status.ForeColor = Theme.Red; status.Text = "送出失敗：" + error + "。請確認網路後再試一次。";
+                    send.Enabled = cancel.Enabled = true;
+                };
+                f.Shown += (s, e) => message.Focus();
+                f.ShowDialog(this);
+            }
+        }
+
+        static string Tail(string s, int max) { return s.Length > max ? s.Substring(s.Length - max) : s; }
+        static string AppVersion() { try { return "建置 " + File.GetLastWriteTime(Application.ExecutablePath).ToString("yyyy-MM-dd HH:mm"); } catch { return ""; } }
+        static string OsName() {
+            try {
+                using (var k = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(@"SOFTWARE\Microsoft\Windows NT\CurrentVersion"))
+                    return k.GetValue("ProductName") + " " + k.GetValue("DisplayVersion") + "（組建 " + k.GetValue("CurrentBuild") + "）";
+            } catch { return Environment.OSVersion.ToString(); }
         }
 
         void SetAll(bool on) {
