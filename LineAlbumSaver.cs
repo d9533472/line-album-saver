@@ -844,7 +844,9 @@ namespace LineAlbumSaver {
             windows.ItemHeight = P(17); windows.BackColor = Theme.Field; windows.ForeColor = Theme.Text; windows.DrawItem += DrawWindowItem;
             dest.BackColor = Theme.Field; dest.ForeColor = Theme.Text;
             form.Controls.Add(FieldLabel("LINE 視窗"), 0, 0); form.Controls.Add(Field(windows, windows.ItemHeight + P(6)), 1, 0); form.Controls.Add(refresh, 2, 0);
-            form.Controls.Add(FieldLabel("儲存位置"), 0, 1); form.Controls.Add(Field(dest, dest.PreferredHeight), 1, 1); form.Controls.Add(browse, 2, 1);
+            var winHint = new Label { Text = "請打開您需要下載的相簿視窗後，按下重新整理，並選擇您要下載的群組名稱相簿頁", AutoSize = true, Anchor = AnchorStyles.Left, ForeColor = Theme.Muted, Margin = new Padding(P(1), P(1), 0, P(5)) };
+            form.Controls.Add(winHint, 1, 1); form.SetColumnSpan(winHint, 2);
+            form.Controls.Add(FieldLabel("儲存位置"), 0, 2); form.Controls.Add(Field(dest, dest.PreferredHeight), 1, 2); form.Controls.Add(browse, 2, 2);
 
             var actions = new TableLayoutPanel { Dock = DockStyle.Top, AutoSize = true, ColumnCount = 6, Margin = new Padding(0, P(6), 0, 0), BackColor = Theme.Card };
             for (int i = 0; i < 6; i++) actions.ColumnStyles.Add(i == 4 ? new ColumnStyle(SizeType.Percent, 100) : new ColumnStyle(SizeType.AutoSize));
