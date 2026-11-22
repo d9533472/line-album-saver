@@ -1224,7 +1224,7 @@ namespace LineAlbumSaver {
                 kind.Items.AddRange(new object[] { "問題回報", "功能建議", "其他" }); kind.SelectedIndex = 0;
                 var message = new TextBox { Multiline = true, ScrollBars = ScrollBars.Vertical, AcceptsReturn = true, Dock = DockStyle.Fill, BackColor = Theme.Field, ForeColor = Theme.Text, BorderStyle = BorderStyle.FixedSingle, MaxLength = 5000, Margin = new Padding(0, P(2), 0, P(6)) };
                 var contact = new TextBox { Dock = DockStyle.Fill, BackColor = Theme.Field, ForeColor = Theme.Text, BorderStyle = BorderStyle.FixedSingle, MaxLength = 200, Margin = new Padding(0, P(2), 0, P(6)) };
-                var withLog = new CheckBox { Text = "附上執行紀錄（內含相簿名稱與資料夾路徑，方便作者查問題）", AutoSize = true, ForeColor = Theme.Muted, Margin = new Padding(0, 0, 0, P(6)), Enabled = logBox.TextLength > 0 };
+                var withLog = new CheckBox { Text = "附上執行紀錄（內含相簿名稱與資料夾路徑，方便作者查問題）", AutoSize = true, ForeColor = Theme.Muted, Margin = new Padding(0, 0, 0, P(6)) };
                 var status = new Label { AutoSize = true, Anchor = AnchorStyles.Left, ForeColor = Theme.Muted, MaximumSize = new Size(P(250), 0) };
                 var send = new Btn { Text = "送出", Primary = true, AutoSize = true, Padding = new Padding(P(14), P(2), P(14), P(2)), Enabled = false, ForeColor = Theme.Text, Margin = new Padding(P(8), 0, 0, 0) };
                 var cancel = new Btn { Text = "取消", AutoSize = true, Padding = new Padding(P(14), P(2), P(14), P(2)), DialogResult = DialogResult.Cancel, ForeColor = Theme.Text, Margin = new Padding(P(8), 0, 0, 0) };
