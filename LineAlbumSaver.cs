@@ -310,7 +310,7 @@ namespace LineAlbumSaver {
         public bool Delete;   // 勾選刪除（只有張數核對完全相符的才勾得到）
         public bool Deletable { get {
             return Abs >= 0 && Expected > 0 && Actual == Expected && !string.IsNullOrEmpty(Folder) && Directory.Exists(Folder)
-                && (Status.StartsWith("完成 ✔") || Status.StartsWith("已下載（張數相符）"));
+                && (Status.StartsWith("完成 ✔") || Status.StartsWith("已下載（張數相符）") || Status.StartsWith("略過（已下載過，張數相符）"));
         } }
     }
 
