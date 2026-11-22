@@ -169,6 +169,19 @@ namespace LineAlbumSaver {
             int total = 0; foreach (Match m in ms) { int v; if (int.TryParse(m.Value, out v)) total += v; }
             return total;
         }
+        // 兩次 OCR 讀同一張卡片可能差一兩個字：一樣、互相包含、或編輯距離在 20% 以內就算同一本。
+        public static bool Similar(string a, string b) {
+            a = Compact(a).TrimEnd('…', '.'); b = Compact(b).TrimEnd('…', '.');
+            if (a.Length == 0 || b.Length == 0) return a == b;
+            if (a == b || a.Contains(b) || b.Contains(a)) return true;
+            var d = new int[a.Length + 1, b.Length + 1];
+            for (int i = 0; i <= a.Length; i++) d[i, 0] = i;
+            for (int j = 0; j <= b.Length; j++) d[0, j] = j;
+            for (int i = 1; i <= a.Length; i++)
+                for (int j = 1; j <= b.Length; j++)
+                    d[i, j] = Math.Min(Math.Min(d[i - 1, j] + 1, d[i, j - 1] + 1), d[i - 1, j - 1] + (a[i - 1] == b[j - 1] ? 0 : 1));
+            return d[a.Length, b.Length] <= Math.Max(1, Math.Max(a.Length, b.Length) / 5);
+        }
         public static bool IsSaveAll(string s) {
             s = Compact(s);
             return (s.Contains("全部") && (s.Contains("儲") || s.Contains("存") || s.Contains("保"))) || s.Contains("儲存全") || s.ToLowerInvariant().Contains("saveall");
@@ -278,7 +291,11 @@ namespace LineAlbumSaver {
 
     sealed class AlbumRow {
         public int No; public string Name = ""; public int Expected = -1; public int Actual; public string Status = ""; public string Folder = "";
+        // 快速掃描記下的：總覽上的絕對位置（捲軸座標）、卡片上讀到的名稱、是否勾選下載
+        public double Abs = -1; public string ScanName = ""; public bool Selected;
     }
+
+    sealed class Card { public double Abs; public Rectangle Band, Item; public bool Visible; }
 
     sealed class Runner {
         readonly Ocr ocr; readonly Action<string> log; readonly Action<AlbumRow> report; readonly CancellationToken token;
@@ -288,59 +305,114 @@ namespace LineAlbumSaver {
         void Check() { token.ThrowIfCancellationRequested(); }
         void Sleep(int ms) { if (token.WaitHandle.WaitOne(ms)) token.ThrowIfCancellationRequested(); }
 
-        public void Run(IntPtr overview, string dest) {
+        AutomationElement Prepare(IntPtr overview, out AutomationElement list, out AutomationElement bar) {
             if (!N.IsWindow(overview)) throw new Exception("選的 LINE 視窗已經關掉了，請按「重新整理」再選一次。");
             pid = N.Pid(overview); scale = N.Scale(overview);
             N.Foreground(overview); Sleep(300);
             var win = AutomationElement.FromHandle(overview);
             if (win.Current.ClassName != "GroupHomeWindow") throw new Exception("選的不是相簿總覽視窗。");
             if (!Detect.OnAlbumTab(win)) throw new Exception("相簿總覽目前在「記事本」頁籤，請先切到「相簿」。");
-            var list = Ui.First(win, "LcListView");
+            list = Ui.First(win, "LcListView");
             if (list == null) throw new Exception("相簿總覽裡找不到相簿清單。");
-            var bar = Ui.First(win, "LcScrollBar");
-            log("開始：從目前捲軸位置往下逐本處理。螢幕縮放 " + (int)(scale * 100) + "%。");
+            bar = Ui.First(win, "LcScrollBar");
+            return win;
+        }
 
-            var done = new List<double>(); int no = 0, noMove = 0; bool first = true;
-            // 一般相簿卡片的高度。最後一本下方多一段空白，卡片會比較高，名稱位置要從頂端算。
-            int cardH = int.MaxValue; double small = SmallChange(bar);
-            if (small * scale >= 150 * scale) cardH = (int)Math.Round(small * scale);
+        // 一般相簿卡片的高度。最後一本下方多一段空白，卡片會比較高，名稱位置要從頂端算。
+        int InitCardH(AutomationElement bar) {
+            double small = SmallChange(bar);
+            return small * scale >= 150 * scale ? (int)Math.Round(small * scale) : int.MaxValue;
+        }
+
+        // 目前畫面上的相簿卡片（由上往下）；Visible＝名稱區完整露出、可以讀字或點擊。
+        List<Card> Cards(AutomationElement list, AutomationElement bar, ref int cardH, out double v, out double max) {
+            var lr = Ui.R(list); v = ScrollValue(bar, out max);
+            var items = Ui.Rows(list);
+            foreach (var it in items) { int h = Ui.R(it).Height; if (h >= 150 * scale && h < cardH) cardH = h; }
+            var cards = new List<Card>();
+            foreach (var it in items.OrderBy(i => Ui.R(i).Top)) {
+                var r = Ui.R(it); if (r.Height < 100 * scale) continue;
+                var item = new Rectangle(r.X, r.Y, r.Width, Math.Min(r.Height, cardH));
+                var band = NameBand(item);
+                cards.Add(new Card { Abs = v + (r.Top - lr.Top) / scale, Item = item, Band = band, Visible = band.Top >= lr.Top && band.Bottom <= lr.Bottom });
+            }
+            return cards;
+        }
+
+        // 讀卡片名稱區：第一行是名稱，「N張」那行是張數（名稱常帶日期數字，不能直接抓數字）。
+        void ReadCard(Rectangle band, out string name, out int count) {
+            var lines = ocr.Read(band);
+            name = lines.Count > 0 ? Txt.Fix(lines[0].Text) : ""; count = -1;
+            foreach (var l in lines.Skip(1)) {
+                if (Regex.IsMatch(Txt.Compact(l.Text), @"\d+(張|部|個|項|photo|video|item)", RegexOptions.IgnoreCase)) { count = Txt.Count(l.Text); break; }
+            }
+        }
+
+        // ① 快速掃描：從最上面捲到最底，只讀每本的名稱與張數，不點開任何相簿。
+        public List<AlbumRow> Scan(IntPtr overview) {
+            AutomationElement list, bar; Prepare(overview, out list, out bar);
+            log("快速掃描：從最上面往下讀相簿名稱與張數，不會點開相簿。螢幕縮放 " + (int)(scale * 100) + "%。");
+            if (bar != null && SetScroll(bar, 0)) Sleep(700);
+            var found = new List<AlbumRow>(); int noMove = 0, cardH = InitCardH(bar);
             while (true) {
                 Check();
                 if (!N.IsWindow(overview)) throw new Exception("相簿總覽視窗被關掉了。");
-                var lr = Ui.R(list); double max; double v = ScrollValue(bar, out max);
-                var items = new List<AutomationElement>();
-                items.AddRange(Ui.Rows(list));
-                AutomationElement next = null; Rectangle nextBand = Rectangle.Empty, nextCard = Rectangle.Empty; double nextAbs = 0;
-                foreach (var it in items) { int h = Ui.R(it).Height; if (h >= 150 * scale && h < cardH) cardH = h; }
-                foreach (var it in items.OrderBy(i => Ui.R(i).Top)) {
-                    var r = Ui.R(it); if (r.Height < 100 * scale) continue;
-                    double abs = v + (r.Top - lr.Top) / scale;
-                    if (done.Any(d => Math.Abs(d - abs) < 30)) continue;
-                    var card = new Rectangle(r.X, r.Y, r.Width, Math.Min(r.Height, cardH));
-                    var band = NameBand(card);
-                    if (band.Top < lr.Top) { if (first) done.Add(abs); continue; } // 名稱已經捲到上面看不到：屬於「目前位置之前」
-                    if (band.Bottom > lr.Bottom) break; // 名稱還沒完整出現，先往下捲
-                    next = it; nextBand = band; nextCard = card; nextAbs = abs; break;
+                double v, max; var cards = Cards(list, bar, ref cardH, out v, out max);
+                foreach (var c in cards.Where(c => c.Visible)) {
+                    if (found.Any(f => Math.Abs(f.Abs - c.Abs) < 30)) continue;
+                    string name; int count; ReadCard(c.Band, out name, out count);
+                    var row = new AlbumRow { No = found.Count + 1, Abs = c.Abs, Name = name, ScanName = name, Expected = count, Status = "掃描到" };
+                    found.Add(row); report(row);
                 }
-                first = false;
-                if (next != null) {
-                    done.Add(nextAbs); no++;
-                    var row = new AlbumRow { No = no };
-                    try { DoAlbum(win, overview, nextBand, nextCard, dest, row); }
-                    catch (OperationCanceledException) { row.Status = "已停止"; report(row); throw; }
-                    catch (Exception ex) { row.Status = "失敗：" + ex.Message; log("第 " + no + " 本失敗：" + ex.Message); CloseStray(); }
-                    report(row);
-                    N.Foreground(overview); Sleep(400);
-                    continue;
-                }
-                if (bar == null || v >= max - 0.5) { log("已經捲到最底，掃描結束。"); break; }
+                if (bar == null || v >= max - 0.5) break;
+                var lr = Ui.R(list);
                 double step = Math.Max(60, lr.Height / scale * 0.5);
                 if (!SetScroll(bar, Math.Min(max, v + step))) N.Wheel(new Point(lr.Left + lr.Width / 2, lr.Top + lr.Height / 2), -120);
-                Sleep(500);
+                Sleep(450);
                 double v2 = ScrollValue(bar, out max);
                 if (Math.Abs(v2 - v) < 0.5) { if (++noMove >= 4) { log("捲軸連續 4 次沒有移動，停止。"); break; } }
                 else noMove = 0;
             }
+            log("掃描完成：共 " + found.Count + " 本。");
+            return found;
+        }
+
+        // ③ 只下載勾選的相簿：捲到掃描時記下的位置，確認名稱沒變才點開。
+        public void Download(IntPtr overview, string dest, List<AlbumRow> picks) {
+            AutomationElement list, bar; var win = Prepare(overview, out list, out bar);
+            log("開始下載勾選的 " + picks.Count + " 本。");
+            int cardH = InitCardH(bar);
+            foreach (var row in picks) {
+                Check();
+                if (!N.IsWindow(overview)) throw new Exception("相簿總覽視窗被關掉了。");
+                try {
+                    var c = Locate(list, bar, row.Abs, ref cardH);
+                    if (c == null) throw new Exception("總覽上找不到這本相簿的位置，可能有人新增或刪除了相簿，請重新掃描。");
+                    string now; int cnt; ReadCard(c.Band, out now, out cnt);
+                    if (!Txt.Similar(now, row.ScanName)) throw new Exception("這個位置現在是「" + now + "」，跟掃描時的「" + row.ScanName + "」不同，請重新掃描。");
+                    DoAlbum(win, overview, c.Band, c.Item, dest, row);
+                }
+                catch (OperationCanceledException) { row.Status = "已停止"; report(row); throw; }
+                catch (Exception ex) { row.Status = "失敗：" + ex.Message; log("第 " + row.No + " 本失敗：" + ex.Message); CloseStray(); }
+                report(row);
+                N.Foreground(overview); Sleep(400);
+            }
+        }
+
+        Card Locate(AutomationElement list, AutomationElement bar, double abs, ref int cardH) {
+            var lr = Ui.R(list);
+            for (int attempt = 0; attempt < 40; attempt++) {
+                Check();
+                double v, max; var cards = Cards(list, bar, ref cardH, out v, out max);
+                var c = cards.FirstOrDefault(x => Math.Abs(x.Abs - abs) < 30);
+                if (c != null && c.Visible) return c;
+                // 讓卡片頂端靠近清單上緣；直接設捲軸不成功時才用滾輪慢慢靠過去
+                double target = Math.Max(0, Math.Min(max, abs - 20));
+                if (Math.Abs(target - v) < 0.5 && attempt > 0) return null;
+                if (bar == null || !SetScroll(bar, target)) N.Wheel(new Point(lr.Left + lr.Width / 2, lr.Top + lr.Height / 2), target > v ? -120 : 120);
+                Sleep(500);
+            }
+            return null;
         }
 
         // 相簿卡片下緣的名稱＋張數區（避開右邊的 ⋮）。item 要傳「一般卡片高度」裁過的矩形。
@@ -598,7 +670,7 @@ namespace LineAlbumSaver {
         readonly Bitmap nmdcLogo, lineLogo;
         readonly ComboBox windows = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Dock = DockStyle.Fill, FlatStyle = FlatStyle.Flat, DrawMode = DrawMode.OwnerDrawFixed };
         readonly TextBox dest = new TextBox { Dock = DockStyle.Fill, ReadOnly = true, BorderStyle = BorderStyle.None, TabStop = false };
-        readonly Btn refresh, browse, start, stop, recheck, openDir;
+        readonly Btn refresh, browse, scan, download, stop, recheck, openDir, selAll, selNone;
         readonly NumericUpDown timeout = new NumericUpDown { Minimum = 60, Maximum = 7200, Value = 600, Increment = 60, TextAlign = HorizontalAlignment.Center, BorderStyle = BorderStyle.None };
         readonly Label hint = new Label { AutoSize = true };
         readonly Label chipAll, chipOk, chipSkip, chipBad;
@@ -625,9 +697,10 @@ namespace LineAlbumSaver {
             Location = new Point(Math.Max(wa.Left, wa.Right - Width - P(12)), Math.Max(wa.Top, wa.Top + (wa.Height - Height) / 2));
 
             refresh = MakeButton("⟳  重新整理"); browse = MakeButton("選擇資料夾");
-            start = MakeButton("▶  逐步往下掃描並儲存"); start.Primary = true; start.Font = new Font(Font.FontFamily, 8.5f, FontStyle.Bold); start.Padding = new Padding(P(12), P(3), P(12), P(3));
+            scan = MakeButton("①  快速掃描相簿"); scan.Primary = true; scan.Font = new Font(Font.FontFamily, 8.5f, FontStyle.Bold); scan.Padding = new Padding(P(10), P(3), P(10), P(3));
+            download = MakeButton("②  下載勾選的相簿"); download.Primary = true; download.Font = scan.Font; download.Padding = scan.Padding;
             stop = MakeButton("■  停止  F8"); stop.Danger = true; stop.Enabled = false;
-            recheck = MakeButton("✓  重新核對"); openDir = MakeButton("開啟資料夾");
+            recheck = MakeButton("✓  重新核對"); openDir = MakeButton("開啟資料夾"); selAll = MakeButton("全選"); selNone = MakeButton("全不選");
             chipAll = Chip(Theme.Text, Color.FromArgb(22, 42, 58)); chipOk = Chip(Theme.GreenHi, Theme.OkBg); chipSkip = Chip(Theme.Muted, Theme.SkipBg); chipBad = Chip(Theme.Red, Theme.BadBg);
 
             var root = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 4, Margin = new Padding(0), BackColor = Theme.Page };
@@ -649,15 +722,15 @@ namespace LineAlbumSaver {
             form.Controls.Add(FieldLabel("LINE 視窗"), 0, 0); form.Controls.Add(Field(windows, windows.ItemHeight + P(6)), 1, 0); form.Controls.Add(refresh, 2, 0);
             form.Controls.Add(FieldLabel("儲存位置"), 0, 1); form.Controls.Add(Field(dest, dest.PreferredHeight), 1, 1); form.Controls.Add(browse, 2, 1);
 
-            var actions = new TableLayoutPanel { Dock = DockStyle.Top, AutoSize = true, ColumnCount = 5, Margin = new Padding(0, P(6), 0, 0), BackColor = Theme.Card };
-            for (int i = 0; i < 5; i++) actions.ColumnStyles.Add(i == 3 ? new ColumnStyle(SizeType.Percent, 100) : new ColumnStyle(SizeType.AutoSize));
-            actions.Controls.Add(start, 0, 0); actions.Controls.Add(stop, 1, 0); actions.Controls.Add(recheck, 2, 0);
+            var actions = new TableLayoutPanel { Dock = DockStyle.Top, AutoSize = true, ColumnCount = 6, Margin = new Padding(0, P(6), 0, 0), BackColor = Theme.Card };
+            for (int i = 0; i < 6; i++) actions.ColumnStyles.Add(i == 4 ? new ColumnStyle(SizeType.Percent, 100) : new ColumnStyle(SizeType.AutoSize));
+            actions.Controls.Add(scan, 0, 0); actions.Controls.Add(download, 1, 0); actions.Controls.Add(stop, 2, 0); actions.Controls.Add(recheck, 3, 0);
             var wait = new FlowLayoutPanel { AutoSize = true, WrapContents = false, Anchor = AnchorStyles.Right, Margin = new Padding(0), BackColor = Theme.Card };
             wait.Controls.Add(new Label { Text = "每本上限", AutoSize = true, ForeColor = Theme.Muted, Margin = new Padding(0, P(7), P(6), 0) });
             timeout.BackColor = Theme.Field; timeout.ForeColor = Theme.Text; timeout.Width = P(52);
             var tf = Field(timeout, timeout.PreferredHeight); tf.Dock = DockStyle.None; tf.Size = new Size(P(66), timeout.PreferredHeight + P(6)); tf.Padding = new Padding(P(6), P(4), P(2), P(4)); tf.Margin = new Padding(0, P(3), P(5), 0); timeout.Dock = DockStyle.Fill; wait.Controls.Add(tf);
             wait.Controls.Add(new Label { Text = "秒", AutoSize = true, ForeColor = Theme.Muted, Margin = new Padding(0, P(7), 0, 0) });
-            actions.Controls.Add(wait, 4, 0);
+            actions.Controls.Add(wait, 5, 0);
             hint.Margin = new Padding(P(1), P(5), 0, 0); hint.ForeColor = Theme.Muted;
 
             var setup = CardTable("設定", "SETUP");
@@ -666,13 +739,13 @@ namespace LineAlbumSaver {
             root.Controls.Add(setup, 0, 1);
 
             // 下載結果
-            var result = CardTable("下載結果", "RESULTS"); result.Dock = DockStyle.Fill; result.AutoSize = false; result.Margin = new Padding(P(12), P(5), P(12), P(5));
+            var result = CardTable("相簿清單（勾選要下載的）", "ALBUMS"); result.Dock = DockStyle.Fill; result.AutoSize = false; result.Margin = new Padding(P(12), P(5), P(12), P(5));
             var chips = new FlowLayoutPanel { AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, WrapContents = false, Anchor = AnchorStyles.Left, Margin = new Padding(0), BackColor = Theme.Card };
             chips.Controls.Add(chipAll); chips.Controls.Add(chipOk); chips.Controls.Add(chipSkip); chips.Controls.Add(chipBad);
-            var bar = new TableLayoutPanel { Dock = DockStyle.Top, AutoSize = true, ColumnCount = 2, Margin = new Padding(0, 0, 0, P(6)), BackColor = Theme.Card };
-            bar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100)); bar.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-            openDir.Anchor = AnchorStyles.Right; openDir.Margin = new Padding(0);
-            bar.Controls.Add(chips, 0, 0); bar.Controls.Add(openDir, 1, 0);
+            var bar = new TableLayoutPanel { Dock = DockStyle.Top, AutoSize = true, ColumnCount = 4, Margin = new Padding(0, 0, 0, P(6)), BackColor = Theme.Card };
+            bar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100)); for (int i = 0; i < 3; i++) bar.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            selAll.Anchor = selNone.Anchor = openDir.Anchor = AnchorStyles.Right; openDir.Margin = new Padding(0);
+            bar.Controls.Add(chips, 0, 0); bar.Controls.Add(selAll, 1, 0); bar.Controls.Add(selNone, 2, 0); bar.Controls.Add(openDir, 3, 0);
             result.Controls.Add(bar);
             SetupGrid();
             var gridHost = new Panel { Dock = DockStyle.Fill, Padding = new Padding(1), BackColor = Theme.Border, Margin = new Padding(0) };
@@ -699,7 +772,9 @@ namespace LineAlbumSaver {
             };
             openDir.Click += (s, e) => { if (Directory.Exists(dest.Text)) Process.Start("explorer.exe", "\"" + dest.Text + "\""); };
             windows.SelectedIndexChanged += (s, e) => UpdateButtons();
-            start.Click += (s, e) => Start();
+            scan.Click += (s, e) => Scan();
+            download.Click += (s, e) => DownloadPicked();
+            selAll.Click += (s, e) => SetAll(true); selNone.Click += (s, e) => SetAll(false);
             stop.Click += (s, e) => { if (cts != null) { cts.Cancel(); Log("收到停止指令，處理完目前動作後停止。"); } };
             recheck.Click += (s, e) => Recheck();
             try { if (File.Exists(Settings)) SetDest(File.ReadAllText(Settings, Encoding.UTF8).Trim()); } catch { }
@@ -795,7 +870,7 @@ namespace LineAlbumSaver {
         }
 
         void SetupGrid() {
-            grid.Dock = DockStyle.Fill; grid.ScrollBars = ScrollBars.Vertical; grid.ReadOnly = true; grid.AllowUserToAddRows = false; grid.AllowUserToDeleteRows = false; grid.AllowUserToResizeRows = false;
+            grid.Dock = DockStyle.Fill; grid.ScrollBars = ScrollBars.Vertical; grid.ReadOnly = false; grid.AllowUserToAddRows = false; grid.AllowUserToDeleteRows = false; grid.AllowUserToResizeRows = false;
             grid.RowHeadersVisible = false; grid.SelectionMode = DataGridViewSelectionMode.FullRowSelect; grid.MultiSelect = false;
             grid.BackgroundColor = Theme.Field; grid.BorderStyle = BorderStyle.None; grid.CellBorderStyle = DataGridViewCellBorderStyle.SingleHorizontal; grid.GridColor = Color.FromArgb(14, 46, 74);
             grid.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill; grid.EnableHeadersVisualStyles = false;
@@ -804,14 +879,22 @@ namespace LineAlbumSaver {
             grid.RowTemplate.Height = P(22);
             var cs = grid.DefaultCellStyle; cs.BackColor = Theme.Field; cs.ForeColor = Theme.Text; cs.Padding = new Padding(P(4), 0, P(2), 0); cs.WrapMode = DataGridViewTriState.False;
             cs.SelectionBackColor = Color.FromArgb(0, 70, 110); cs.SelectionForeColor = Color.White;
-            string[] heads = { "#", "相簿名稱", "應有", "實際", "狀態", "資料夾" }; float[] weights = { 6, 36, 9, 9, 24, 26 };
+            grid.Columns.Add(new DataGridViewCheckBoxColumn { HeaderText = "下載", FillWeight = 7, MinimumWidth = P(36), SortMode = DataGridViewColumnSortMode.NotSortable });
+            string[] heads = { "#", "相簿名稱", "應有", "實際", "狀態", "資料夾" }; float[] weights = { 6, 34, 8, 8, 24, 22 };
             for (int i = 0; i < heads.Length; i++) {
-                var c = new DataGridViewTextBoxColumn { HeaderText = heads[i], FillWeight = weights[i], SortMode = DataGridViewColumnSortMode.NotSortable, MinimumWidth = P(i == 1 ? 110 : 36) };
+                var c = new DataGridViewTextBoxColumn { HeaderText = heads[i], FillWeight = weights[i], SortMode = DataGridViewColumnSortMode.NotSortable, MinimumWidth = P(i == 1 ? 110 : 36), ReadOnly = true };
                 if (i == 0 || i == 2 || i == 3) { c.DefaultCellStyle.Alignment = DataGridViewContentAlignment.MiddleCenter; c.HeaderCell.Style.Alignment = DataGridViewContentAlignment.MiddleCenter; c.DefaultCellStyle.Font = new Font("Consolas", 8.25f); }
                 grid.Columns.Add(c);
             }
             grid.ShowCellToolTips = true;
-            grid.CellDoubleClick += (s, e) => { if (e.RowIndex >= 0 && e.RowIndex < rows.Count && Directory.Exists(rows[e.RowIndex].Folder)) Process.Start("explorer.exe", "\"" + rows[e.RowIndex].Folder + "\""); };
+            // 勾選框：點了馬上生效（DataGridView 預設要離開格子才提交）
+            grid.CurrentCellDirtyStateChanged += (s, e) => { if (grid.IsCurrentCellDirty && grid.CurrentCell.ColumnIndex == 0) grid.CommitEdit(DataGridViewDataErrorContexts.Commit); };
+            grid.CellValueChanged += (s, e) => {
+                if (e.ColumnIndex != 0 || e.RowIndex < 0 || e.RowIndex >= rows.Count) return;
+                var v = grid.Rows[e.RowIndex].Cells[0].Value; rows[e.RowIndex].Selected = v is bool && (bool)v;
+                UpdateSummary(); UpdateButtons();
+            };
+            grid.CellDoubleClick += (s, e) => { if (e.ColumnIndex > 0 && e.RowIndex >= 0 && e.RowIndex < rows.Count && Directory.Exists(rows[e.RowIndex].Folder)) Process.Start("explorer.exe", "\"" + rows[e.RowIndex].Folder + "\""); };
         }
 
         void SetDest(string path) { dest.Text = path; tips.SetToolTip(dest, path); }
@@ -833,19 +916,22 @@ namespace LineAlbumSaver {
             if (i < 0) { rows.Add(r); i = grid.Rows.Add(); }
             var g = grid.Rows[i];
             string folderName = string.IsNullOrEmpty(r.Folder) ? "" : Path.GetFileName(r.Folder);
-            g.SetValues(r.No, r.Name, r.Expected >= 0 ? r.Expected.ToString() : "?", r.Actual, r.Status, folderName);
-            g.Cells[5].ToolTipText = r.Folder; g.Cells[1].ToolTipText = r.Name; g.Cells[4].ToolTipText = r.Status;
-            bool ok = r.Status.StartsWith("完成"), skip = r.Status.StartsWith("略過"), bad = r.Status.StartsWith("失敗") || r.Status.StartsWith("不完整") || r.Status.StartsWith("已停止");
-            g.DefaultCellStyle.BackColor = ok ? Theme.OkBg : skip ? Theme.SkipBg : bad ? Theme.BadBg : Theme.RunBg;
-            g.Cells[4].Style.ForeColor = ok ? Theme.GreenHi : bad ? Theme.Red : skip ? Theme.Muted : Theme.Amber;
-            g.Cells[4].Style.Font = new Font(Font, FontStyle.Bold);
+            g.SetValues(r.Selected, r.No, r.Name, r.Expected >= 0 ? r.Expected.ToString() : "?", r.Actual, r.Status, folderName);
+            g.Cells[6].ToolTipText = r.Folder; g.Cells[2].ToolTipText = r.Name; g.Cells[5].ToolTipText = r.Status;
+            bool ok = r.Status.StartsWith("完成"), skip = r.Status.StartsWith("略過") || r.Status.StartsWith("已下載"), bad = r.Status.StartsWith("失敗") || r.Status.StartsWith("不完整") || r.Status.StartsWith("已停止");
+            bool idle = r.Status == "未下載" || r.Status == "掃描到" || r.Status.StartsWith("資料夾已有");
+            g.DefaultCellStyle.BackColor = ok ? Theme.OkBg : skip ? Theme.SkipBg : bad ? Theme.BadBg : idle ? Theme.Field : Theme.RunBg;
+            g.Cells[5].Style.ForeColor = ok ? Theme.GreenHi : bad ? Theme.Red : skip || idle ? Theme.Muted : Theme.Amber;
+            g.Cells[5].Style.Font = new Font(Font, FontStyle.Bold);
             try { int shown = grid.DisplayedRowCount(false); if (shown > 0 && i >= shown) grid.FirstDisplayedScrollingRowIndex = i - shown + 1; } catch { }
             UpdateSummary();
         }
 
         void UpdateSummary() {
             int ok = rows.Count(r => r.Status.StartsWith("完成")), skip = rows.Count(r => r.Status.StartsWith("略過")), bad = rows.Count(r => r.Status.StartsWith("失敗") || r.Status.StartsWith("不完整") || r.Status.StartsWith("已停止"));
-            chipAll.Text = "共 " + rows.Count + " 本"; chipOk.Text = "✔ 完成 " + ok; chipSkip.Text = "略過 " + skip; chipBad.Text = "✘ 失敗 " + bad;
+            int pick = rows.Count(r => r.Selected); skip = rows.Count(r => r.Status.StartsWith("略過") || r.Status.StartsWith("已下載"));
+            chipAll.Text = "共 " + rows.Count + " 本・勾選 " + pick; chipOk.Text = "✔ 完成 " + ok; chipSkip.Text = "已下載/略過 " + skip; chipBad.Text = "✘ 失敗 " + bad;
+            download.Text = "②  下載勾選的相簿" + (pick > 0 ? "（" + pick + "）" : "");
         }
 
         void RefreshWindows() {
@@ -865,36 +951,82 @@ namespace LineAlbumSaver {
 
         void UpdateButtons() {
             var w = windows.SelectedItem as LineWindow;
-            start.Enabled = !busy && w != null && w.IsOverview && w.OnAlbumTab;
-            stop.Enabled = busy; refresh.Enabled = browse.Enabled = recheck.Enabled = windows.Enabled = !busy;
+            bool ready = !busy && w != null && w.IsOverview && w.OnAlbumTab;
+            scan.Enabled = ready; download.Enabled = ready && rows.Any(r => r.Selected && r.Abs >= 0);
+            stop.Enabled = busy; refresh.Enabled = browse.Enabled = recheck.Enabled = windows.Enabled = selAll.Enabled = selNone.Enabled = !busy;
+            grid.Columns[0].ReadOnly = busy;
             header.Invalidate();
             if (busy) return;
             hint.ForeColor = Theme.Muted;
             if (w != null && !w.IsOverview) { hint.Text = "⚠ 這是「" + w.Label.Trim() + "」，不是相簿總覽。請選名稱後面是「相簿」的那一個。"; hint.ForeColor = Theme.Amber; }
             else if (w != null && !w.OnAlbumTab) { hint.Text = "⚠ 相簿總覽目前在「記事本」頁籤，請在 LINE 切到「相簿」再按重新整理。"; hint.ForeColor = Theme.Amber; }
-            else hint.Text = "在 LINE 打開群組的「相簿」總覽，捲到要開始的位置再按開始。執行中請勿動滑鼠，F8 可隨時停止。";
+            else if (rows.Count == 0) hint.Text = "在 LINE 打開群組的「相簿」總覽，按「① 快速掃描相簿」列出全部相簿（不會點開）。執行中請勿動滑鼠，F8 可隨時停止。";
+            else hint.Text = "在下面清單勾選要下載的相簿，再按「② 下載勾選的相簿」。已下載過、張數相符的預設不勾。";
         }
 
-        async void Start() {
-            var w = windows.SelectedItem as LineWindow;
-            if (w == null || !w.IsOverview) return;
-            if (string.IsNullOrWhiteSpace(dest.Text) || !Directory.Exists(dest.Text)) { MessageBox.Show(this, "請先選擇儲存位置。", "LINE 相簿批次儲存"); return; }
+        bool CanRun(out LineWindow w) {
+            w = windows.SelectedItem as LineWindow;
+            if (w == null || !w.IsOverview) return false;
+            if (string.IsNullOrWhiteSpace(dest.Text) || !Directory.Exists(dest.Text)) { MessageBox.Show(this, "請先選擇儲存位置。", "LINE 相簿批次儲存"); return false; }
+            return true;
+        }
+
+        // 執行期間把工具縮小（讓 LINE 露出來給 OCR 讀），結束再還原。
+        async Task<bool> RunJob(Action<Runner> job) {
             busy = true; cts = new CancellationTokenSource(); UpdateButtons();
             hint.Text = "● 執行中，請勿動滑鼠或鍵盤。按 F8 停止。"; hint.ForeColor = Theme.Amber;
-            string root = dest.Text; var token = cts.Token; int secs = (int)timeout.Value;
+            var token = cts.Token; int secs = (int)timeout.Value; bool ok = false;
             WindowState = FormWindowState.Minimized;
             try {
-                await Task.Run(() => {
-                    var runner = new Runner(ocr, Log, Report, token) { TimeoutSeconds = secs };
-                    runner.Run(w.Hwnd, root);
-                });
-                Log("全部處理完畢。");
+                await Task.Run(() => job(new Runner(ocr, Log, Report, token) { TimeoutSeconds = secs }));
+                ok = true;
             } catch (OperationCanceledException) { Log("已停止。"); }
             catch (Exception ex) { Log("停止：" + ex.Message); MessageBox.Show(this, ex.Message, "已停止"); }
-            finally {
-                busy = false; cts = null; WindowState = FormWindowState.Normal; Activate(); UpdateButtons();
-                SaveReport(root);
+            finally { busy = false; cts = null; WindowState = FormWindowState.Normal; Activate(); UpdateButtons(); }
+            return ok;
+        }
+
+        // ① 快速掃描：只讀總覽卡片，不點開相簿
+        async void Scan() {
+            LineWindow w; if (!CanRun(out w)) return;
+            rows.Clear(); grid.Rows.Clear(); UpdateSummary();
+            string root = dest.Text;
+            await RunJob(r => r.Scan(w.Hwnd));
+            // 對照儲存位置：同名資料夾已有且張數相符 → 已下載、預設不勾
+            foreach (var r in rows) {
+                string folder = Path.Combine(root, Txt.SafeFolder(r.Name.Length > 0 ? r.Name : "相簿_" + r.No));
+                int have = Directory.Exists(folder) ? Ui.CountFiles(folder) : 0;
+                if (have > 0) r.Folder = folder;
+                r.Actual = have;
+                if (have > 0 && r.Expected > 0 && have == r.Expected) { r.Status = "已下載（張數相符）"; r.Selected = false; }
+                else if (have > 0) { r.Status = "資料夾已有 " + have + (r.Expected > 0 ? "/" + r.Expected : "") + " 張"; r.Selected = true; }
+                else { r.Status = "未下載"; r.Selected = true; }
+                Report(r);
             }
+            UpdateSummary(); UpdateButtons();
+            if (rows.Count > 0) Log("掃描到 " + rows.Count + " 本，已勾選 " + rows.Count(r => r.Selected) + " 本（已下載過的不勾）。確認勾選後按「② 下載勾選的相簿」。");
+        }
+
+        // ② 只下載勾選的
+        async void DownloadPicked() {
+            LineWindow w; if (!CanRun(out w)) return;
+            var picks = rows.Where(r => r.Selected && r.Abs >= 0).ToList();
+            if (picks.Count == 0) return;
+            foreach (var r in picks) { r.Status = "等待下載"; Report(r); }
+            string root = dest.Text;
+            if (await RunJob(r => r.Download(w.Hwnd, root, picks))) Log("勾選的相簿都處理完畢。");
+            foreach (var r in picks) {
+                if (r.Status == "等待下載") r.Status = "已停止";
+                if (r.Status.StartsWith("完成") || r.Status.StartsWith("略過")) r.Selected = false;   // 成功的取消勾選，失敗的留著方便重跑
+                Report(r);
+            }
+            UpdateSummary(); UpdateButtons();
+            SaveReport(root);
+        }
+
+        void SetAll(bool on) {
+            foreach (var r in rows) { r.Selected = on; Report(r); }
+            UpdateSummary(); UpdateButtons();
         }
 
         void Recheck() {
@@ -928,10 +1060,11 @@ namespace LineAlbumSaver {
                 f.windows.Items.Add(new LineWindow { Label = "範例群組 相簿", IsOverview = true }); f.windows.SelectedIndex = 0;
                 f.SetDest(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory), "LINE相簿"));
                 f.Show(); Application.DoEvents();
-                f.Report(new AlbumRow { No = 1, Name = "20260831 員工旅遊", Expected = 18, Actual = 18, Status = "完成 ✔", Folder = @"C:\x\20260831 員工旅遊" });
+                f.Report(new AlbumRow { No = 1, Name = "20260831 員工旅遊", Expected = 18, Actual = 18, Status = "完成 ✔", Folder = @"C:\x\20260831 員工旅遊", Selected = true, Abs = 0 });
                 f.Report(new AlbumRow { No = 2, Name = "20260826 聚餐", Expected = 7, Actual = 7, Status = "完成 ✔", Folder = @"C:\x\20260826 聚餐" });
                 f.Report(new AlbumRow { No = 3, Name = "20260725 晨會", Expected = 14, Actual = 11, Status = "不完整 11/14", Folder = @"C:\x\20260725 晨會" });
-                f.Report(new AlbumRow { No = 4, Name = "2026/10/31 很長很長的相簿名稱測試", Expected = 9, Actual = 9, Status = "略過（已下載過，張數相符）", Folder = @"C:\x\20261031 相簿" });
+                f.Report(new AlbumRow { No = 4, Name = "2026/10/31 很長很長的相簿名稱測試", Expected = 9, Actual = 9, Status = "已下載（張數相符）", Folder = @"C:\x\20261031 相簿" });
+                f.Report(new AlbumRow { No = 6, Name = "20260401 春酒", Expected = 32, Status = "未下載", Selected = true, Abs = 900 });
                 f.Report(new AlbumRow { No = 5, Name = "20260517 活動照片", Expected = 24, Actual = 13, Status = "下載中… 13/24", Folder = @"C:\x\20260517 活動照片" });
                 f.Log("開始：從目前捲軸位置往下逐本處理。螢幕縮放 150%。"); f.Log("第 1 本：點「20260831 員工旅遊」"); f.Log("　完成 ✔　→ C:\\x\\20260831 員工旅遊");
                 if (running) { f.busy = true; f.UpdateButtons(); }
