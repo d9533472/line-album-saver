@@ -192,6 +192,10 @@ namespace LineAlbumSaver {
             s = Compact(s).ToLowerInvariant();
             return s == "刪除" || s == "確定" || s == "确定" || s == "删除" || s == "ok" || s == "delete";
         }
+        public static bool IsCancelWord(string s) {
+            s = Compact(s).ToLowerInvariant();
+            return s.Contains("取消") || s.Contains("cancel");
+        }
         public static bool IsSaveAll(string s) {
             s = Compact(s);
             return (s.Contains("全部") && (s.Contains("儲") || s.Contains("存") || s.Contains("保"))) || s.Contains("儲存全") || s.ToLowerInvariant().Contains("saveall");
@@ -598,9 +602,11 @@ namespace LineAlbumSaver {
                         log("　核對：LINE「" + title + "」" + expected + " 張，資料夾 " + have + " 個檔");
                         if (!Txt.Similar(title, row.Name) && !Txt.Similar(title, row.ScanName)) throw new Exception("打開的相簿是「" + title + "」，跟清單上的不同。未刪除。");
                         if (expected <= 0 || have != expected || expected != row.Expected) throw new Exception("張數不符（LINE " + expected + "、資料夾 " + have + "）。未刪除。");
+                        // 先記下「按刪除相簿之前」的視窗與按鈕，確認視窗的按鈕才分得出是新出現的
                         var beforeWins = new HashSet<IntPtr>(Ui.TopWindows().Select(Ui.Hwnd));
+                        var beforeBtns = new HashSet<string>(AllButtons(detail).Select(b => Ui.R(b).ToString()));
                         ClickMenu(detail, Txt.IsDeleteAlbum, "刪除相簿");
-                        ConfirmDelete(beforeWins, detail);
+                        ConfirmDelete(beforeWins, beforeBtns, detail);
                         // 刪掉後單本相簿視窗會自己關掉
                         for (int i = 0; i < 40 && N.IsWindow(dh); i++) Sleep(250);
                         deleted = !N.IsWindow(dh);
@@ -616,44 +622,55 @@ namespace LineAlbumSaver {
             }
         }
 
-        // LINE 的「確定刪除？」：可能是新的頂層視窗，也可能疊在單本視窗裡。只按名稱「剛好是」刪除／確定的按鈕。
-        void ConfirmDelete(HashSet<IntPtr> beforeWins, AutomationElement detail) {
-            var detailBtnsBefore = new HashSet<string>(ConfirmButtons(detail).Select(b => Ui.R(b).ToString()));
-            var sw = Stopwatch.StartNew();
-            while (sw.ElapsedMilliseconds < 6000) {
+        // LINE 的確認視窗：「取消」＋紅色「刪除」。可能是新的頂層視窗，也可能疊在單本視窗裡。
+        // LINE 的按鈕常常沒有原文，所以每顆新按鈕都用 OCR 讀字、並看底色：
+        // 字剛好是「刪除／確定」才按；讀不到字時，只有「唯一一顆紅色、而且不是取消」的按鈕才按。
+        void ConfirmDelete(HashSet<IntPtr> beforeWins, HashSet<string> beforeBtns, AutomationElement detail) {
+            var sw = Stopwatch.StartNew(); bool logged = false;
+            while (sw.ElapsedMilliseconds < 8000) {
                 Check();
+                var cands = new List<AutomationElement>();
                 var fresh = Ui.TopWindows().Where(e => !beforeWins.Contains(Ui.Hwnd(e))).Where(e => { try { return e.Current.ClassName != "LcContextMenu"; } catch { return false; } }).ToList();
-                foreach (var w in fresh) {
-                    string cls = ""; try { cls = w.Current.ClassName; } catch { }
-                    var lines = ocr.Read(Ui.R(w));
-                    log("　確認視窗［" + cls + "］：" + string.Join("、", lines.Select(l => Txt.Fix(l.Text))) + "｜按鈕：" + string.Join("、", AllButtons(w).Select(b => b.Current.Name)));
-                    var btn = ConfirmButtons(w).FirstOrDefault();
-                    Rectangle target = btn != null ? Ui.R(btn) : Rectangle.Empty;
-                    if (target.IsEmpty) { var hit = lines.FirstOrDefault(l => Txt.IsConfirmWord(l.Text)); if (hit != null) target = Rectangle.Round(hit.Box); }
-                    if (target.IsEmpty) { N.Escape(); throw new Exception("確認視窗裡找不到「刪除／確定」按鈕，已取消。未刪除。"); }
-                    N.Click(new Point(target.Left + target.Width / 2, target.Top + target.Height / 2), pid, "確認刪除");
-                    log("　已按確認刪除");
-                    return;
+                foreach (var w in fresh) cands.AddRange(AllButtons(w));
+                cands.AddRange(AllButtons(detail).Where(b => !beforeBtns.Contains(Ui.R(b).ToString())));
+                var info = cands.Select(b => { var r = Ui.R(b); string name = ""; try { name = (b.Current.Name ?? "").Trim(); } catch { }
+                    string text = name.Length > 0 ? name : (r.Width > 4 && r.Height > 4 ? Txt.Fix(ocr.Text(r)) : "");
+                    return new { R = r, Text = text, Red = IsRed(r) }; }).Where(x => !x.R.IsEmpty).ToList();
+                if (info.Count > 0) {
+                    if (!logged) { log("　確認視窗按鈕：" + string.Join("、", info.Select(x => "「" + x.Text + "」" + (x.Red ? "(紅)" : "")))); logged = true; }
+                    var pick = info.FirstOrDefault(x => Txt.IsConfirmWord(x.Text));
+                    if (pick == null) { var reds = info.Where(x => x.Red && !Txt.IsCancelWord(x.Text)).ToList(); if (reds.Count == 1) pick = reds[0]; }
+                    if (pick != null) {
+                        N.Click(new Point(pick.R.Left + pick.R.Width / 2, pick.R.Top + pick.R.Height / 2), pid, "確認刪除");
+                        log("　已按確認視窗的「" + (pick.Text.Length > 0 ? pick.Text : "紅色按鈕") + "」");
+                        return;
+                    }
                 }
-                var inner = ConfirmButtons(detail).FirstOrDefault(b => !detailBtnsBefore.Contains(Ui.R(b).ToString()));
-                if (inner != null) {
-                    log("　確認按鈕（相簿視窗內）：" + inner.Current.Name);
-                    var r = Ui.R(inner); N.Click(new Point(r.Left + r.Width / 2, r.Top + r.Height / 2), pid, "確認刪除");
-                    log("　已按確認刪除");
-                    return;
-                }
-                Sleep(250);
+                Sleep(300);
             }
             N.Escape();
-            throw new Exception("按了「刪除相簿」但沒有出現確認視窗，已取消。未刪除。");
+            throw new Exception(logged ? "確認視窗裡分不出哪一顆是「刪除」，已取消。未刪除。" : "按了「刪除相簿」但沒有找到確認視窗，已取消。未刪除。");
         }
+        // 按鈕底色偏紅（LINE 的刪除鈕是紅底白字）：取整顆按鈕的平均色。
+        static bool IsRed(Rectangle r) {
+            if (r.Width < 4 || r.Height < 4) return false;
+            try {
+                using (var b = N.Capture(r)) {
+                    long R = 0, G = 0, B = 0, n = 0;
+                    for (int y = 1; y < b.Height - 1; y += 2) for (int x = 1; x < b.Width - 1; x += 2) { var c = b.GetPixel(x, y); R += c.R; G += c.G; B += c.B; n++; }
+                    if (n == 0) return false; R /= n; G /= n; B /= n;
+                    return R > 140 && R > G + 50 && R > B + 50;
+                }
+            } catch { return false; }
+        }
+        // LINE 的按鈕不一定是 Button 類型，LcButton 也收。
         static List<AutomationElement> AllButtons(AutomationElement root) {
             var list = new List<AutomationElement>();
-            try { foreach (AutomationElement e in root.FindAll(TreeScope.Descendants, new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Button))) list.Add(e); } catch { }
+            try {
+                var cond = new OrCondition(new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Button), new PropertyCondition(AutomationElement.ClassNameProperty, "LcButton"));
+                foreach (AutomationElement e in root.FindAll(TreeScope.Descendants, cond)) list.Add(e);
+            } catch { }
             return list;
-        }
-        static List<AutomationElement> ConfirmButtons(AutomationElement root) {
-            return AllButtons(root).Where(e => { try { return Txt.IsConfirmWord(e.Current.Name) && !Ui.R(e).IsEmpty; } catch { return false; } }).ToList();
         }
 
         // LINE 按「儲存全部」後會跳出 Windows 的「選擇資料夾」視窗：路徑框 ID 1152、確認鈕 ID 1。
