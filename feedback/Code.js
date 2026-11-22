@@ -1,6 +1,6 @@
 // LINE 相簿批次儲存：接收程式裡「意見回饋」視窗送來的內容，轉寄到作者信箱。
 // 部署成網頁應用程式（以自己的身分執行、所有人皆可存取），網址填到 LineAlbumSaver.cs 的 FeedbackUrl。
-const TO = 'd9533472@gmail.com';
+const TO = 'paul.tong@nmdc-group.com';
 const MAX_PER_10_MIN = 20;
 
 function doPost(e) {
